@@ -1,94 +1,59 @@
 package vgactrl
 
 import chisel3._
-import chisel3.util.Counter
-import chisel3.util.{switch, is}
 import chisel3.stage.ChiselStage
+import chisel3.util.Counter
+import chisel3.util.Valid
 
-class TimingDescriptor(visibleArea: Int, frontPorch: Int, syncPulse: Int, backPorch: Int) {
-    def syncStart(): Int = {
-        visibleArea + frontPorch
-    }
-    def syncEnd(): Int = {
-        syncStart + syncPulse
-    }
-    def whole(): Int = {
-        syncEnd + backPorch
-    }
-}
-
-class VGACtrl(
-    verticalDescriptor: TimingDescriptor = new TimingDescriptor(
-        visibleArea = 600,
-        frontPorch = 37,
-        syncPulse = 6,
-        backPorch = 23,
-    ),
-    horizontalDescriptor: TimingDescriptor = new TimingDescriptor(
-        visibleArea = 800,
-        frontPorch = 56,
-        syncPulse = 120,
-        backPorch = 64,
-    ),
-    colorDepth: Int = 12,
-    pixelClockDivisor: Int = 2,
-    ) extends Module {
-
-    val PerColorDepth = colorDepth / 3
+class VGACtrl(resolution: Resolution, clockDivisor: Int) extends Module {
+    val frame = Module(new Frame(resolution, clockDivisor))
+    val spiSlave = Module(new SPISlave(16 + 16 + 16))
 
     val io = IO(new Bundle {
-        val red = Output(UInt(PerColorDepth.W))
-        val green = Output(UInt(PerColorDepth.W))
-        val blue = Output(UInt(PerColorDepth.W))
-        val verticalSync = Output(Bool())
-        val horizontalSync = Output(UInt(1.W))
+        val vga = Output(new VGA(resolution.depth))
+        val spi = new SPI
     })
 
-    val pixelClock = Counter(pixelClockDivisor).inc().asClock()
-    val lineCounter = withClock(pixelClock) {
-        Counter(verticalDescriptor.whole())
-    }
-    val verticalSync = RegInit(1.U(1.W))
-    switch(lineCounter.value) {
-        is(verticalDescriptor.syncStart().U) {
-            verticalSync := 0.U
-        }
-        is(verticalDescriptor.syncEnd().U) {
-            verticalSync := 1.U
-        }
-    }
+    io.vga := frame.io.vga
 
-    val pixelCounter = withClock(pixelClock) {
-        Counter(horizontalDescriptor.whole())
-    }
-    pixelCounter.inc()
-    val horizontalSync = RegInit(1.U(1.W))
-    switch(pixelCounter.value) {
-        is(horizontalDescriptor.syncStart().U) {
-            horizontalSync := 0.U
-        }
-        is(horizontalDescriptor.syncEnd().U) {
-            horizontalSync := 1.U
-        }
-        is((horizontalDescriptor.whole() - 1).U) {
-            lineCounter.inc()
-        }
-    }
-    io.horizontalSync := horizontalSync
+    spiSlave.io.spi.ss := RegNext(RegNext(io.spi.ss))
+    spiSlave.io.spi.mosi := RegNext(RegNext(io.spi.mosi))
+    spiSlave.io.spi.sck := RegNext(RegNext(io.spi.sck))
 
-    io.verticalSync := verticalSync
+    frame.io.pixel.valid := spiSlave.io.output.valid
 
-    when (pixelCounter.value >= 100.U && pixelCounter.value <= 200.U) {
-        io.red := 0.U
-        io.green := 4.U
-        io.blue := 4.U
-    } .otherwise {
-        io.red := 0.U
-        io.green := 0.U
-        io.blue := 0.U
-    }
+    frame.io.pixel.bits.verticalIndex := spiSlave.io.output.bits(47, 32)
+    frame.io.pixel.bits.horizontalIndex := spiSlave.io.output.bits(31, 16)
+
+    val redRange = Color.redRange(resolution.depth)
+    val greenRange = Color.greenRange(resolution.depth)
+    val blueRange = Color.blueRange(resolution.depth)
+
+    frame.io.pixel.bits.red := spiSlave.io.output.bits(redRange._1, redRange._2)
+    frame.io.pixel.bits.green := spiSlave.io.output.bits(greenRange._1, greenRange._2)
+    frame.io.pixel.bits.blue := spiSlave.io.output.bits(blueRange._1, blueRange._2)
 }
 
 object VGACtrl extends App{
-    (new ChiselStage).emitVerilog(new VGACtrl, Array("--target-dir", "target"))
+    (new ChiselStage).emitVerilog(
+        new VGACtrl(
+            resolution = new Resolution (
+                vertical = new Axis (
+                    visibleArea = 400,
+                    frontPorch = 12,
+                    syncPulse = 2,
+                    backPorch = 35,
+                ),
+                horizontal = new Axis (
+                    visibleArea = 640,
+                    frontPorch = 16,
+                    syncPulse = 96,
+                    backPorch = 48,
+                ),
+                depth = 12
+            ),
+            clockDivisor = 4
+        ),
+        Array("--target-dir", "target")
+    )
 }
